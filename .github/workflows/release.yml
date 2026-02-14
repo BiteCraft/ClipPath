@@ -1,0 +1,112 @@
+name: Build & Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  check-version:
+    name: Check version bump
+    runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.compare.outputs.should_release }}
+      version: ${{ steps.compare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Compare versions
+        id: compare
+        run: |
+          CURRENT=$(node -p "require('./package.json').version")
+          echo "Current version: $CURRENT"
+
+          # Get the version from the previous commit on main
+          PREVIOUS=$(git show HEAD~1:package.json 2>/dev/null | node -p "JSON.parse(require('fs').readFileSync('/dev/stdin','utf8')).version" 2>/dev/null || echo "0.0.0")
+          echo "Previous version: $PREVIOUS"
+
+          # Compare using sort -V (version sort)
+          HIGHER=$(printf '%s\n%s' "$PREVIOUS" "$CURRENT" | sort -V | tail -n1)
+
+          if [ "$CURRENT" != "$PREVIOUS" ] && [ "$CURRENT" = "$HIGHER" ]; then
+            echo "Version bumped: $PREVIOUS → $CURRENT"
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No version bump detected, skipping build & release."
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "version=$CURRENT" >> "$GITHUB_OUTPUT"
+
+  test:
+    name: Test
+    needs: check-version
+    if: needs.check-version.outputs.should_release == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - run: bun install
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Tests
+        run: bun test
+
+  build:
+    name: Build
+    needs: [check-version, test]
+    if: needs.check-version.outputs.should_release == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - run: bun install
+
+      - name: Build executable
+        run: bun run build
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: clippath-windows-x64
+          path: builds/clippath.exe
+
+  release:
+    name: Release
+    needs: [check-version, build]
+    if: needs.check-version.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: clippath-windows-x64
+
+      - name: Create tag
+        run: |
+          git tag "v${{ needs.check-version.outputs.version }}"
+          git push origin "v${{ needs.check-version.outputs.version }}"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.check-version.outputs.version }}
+          name: ClipPath v${{ needs.check-version.outputs.version }}
+          files: clippath.exe
+          generate_release_notes: true
